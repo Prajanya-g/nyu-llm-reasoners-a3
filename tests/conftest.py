@@ -210,7 +210,11 @@ def output_strs():
 
 @pytest.fixture
 def model_id():
-    return "/data/a5-alignment/models/Qwen2.5-Math-1.5B"
+    # Handout uses Hub id "Qwen/Qwen2.5-Math-1.5B"; Stanford path is optional via env.
+    return os.environ.get(
+        "TOKENIZER_MODEL_ID",
+        "Qwen/Qwen2.5-Math-1.5B",
+    )
 
 
 @pytest.fixture
