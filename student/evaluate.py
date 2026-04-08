@@ -1,5 +1,7 @@
 """Minimal evaluation script for MATH and Intellect test sets."""
 
+import argparse
+import json
 from pathlib import Path
 
 from datasets import load_dataset, load_from_disk
@@ -15,25 +17,42 @@ def load_prompt(name: str = "intellect") -> str:
 
 
 def evaluate(llm, prompts, ground_truths):
-    """Run evaluation and return accuracy."""
     params = SamplingParams(temperature=0.0, max_tokens=2048)
     outputs = llm.generate(prompts, params)
-
     correct = 0
+    results = []
     for i, output in enumerate(tqdm(outputs, desc="Grading")):
         text = output.outputs[0].text
         reward = question_only_reward_fn(text, ground_truths[i])
         correct += reward["reward"]
-
-    return correct / len(outputs)
+        results.append(
+            {
+                "prompt": prompts[i][-200:],  # last 200 chars to save space
+                "output": text,
+                "ground_truth": ground_truths[i],
+                "reward": reward["reward"],
+                "format_reward": reward["format_reward"],
+                "answer_reward": reward["answer_reward"],
+            }
+        )
+    # Print category counts
+    cat1 = sum(1 for r in results if r["format_reward"] == 1 and r["answer_reward"] == 1)
+    cat2 = sum(1 for r in results if r["format_reward"] == 1 and r["answer_reward"] == 0)
+    cat3 = sum(1 for r in results if r["format_reward"] == 0 and r["answer_reward"] == 0)
+    print(f"  Cat1 (format=1, answer=1): {cat1}")
+    print(f"  Cat2 (format=1, answer=0): {cat2}")
+    print(f"  Cat3 (format=0, answer=0): {cat3}")
+    return correct / len(outputs), results
 
 
 def main():
-    import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="Qwen/Qwen2.5-Math-1.5B")
     parser.add_argument("--max-examples", type=int, default=500)
-    parser.add_argument("--intellect-path", default="data/intellect_math_train_dev_test/test")
+    parser.add_argument(
+        "--intellect-path",
+        default="data-distrib/intellect_math/test",
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     args = parser.parse_args()
 
@@ -61,8 +80,10 @@ def main():
         gts.append(ex.get("ground_truth", ""))
 
     print(f"[Sample] {prompts[0][:200]}...")
-    acc = evaluate(llm, prompts, gts)
+    acc, results = evaluate(llm, prompts, gts)
     print(f"Intellect Accuracy: {acc:.4f}")
+    with open("intellect_results.json", "w") as f:
+        json.dump(results, f, indent=2)
 
     # Evaluate on MATH
     print("\n=== MATH Test ===")
@@ -74,8 +95,10 @@ def main():
     gts = [ex["answer"] for ex in math_ds]
 
     print(f"[Sample] {prompts[0][:200]}...")
-    acc = evaluate(llm, prompts, gts)
+    acc, results = evaluate(llm, prompts, gts)
     print(f"MATH Accuracy: {acc:.4f}")
+    with open("math_results.json", "w") as f:
+        json.dump(results, f, indent=2)
 
 
 if __name__ == "__main__":
