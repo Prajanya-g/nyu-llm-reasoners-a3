@@ -210,7 +210,10 @@ def output_strs():
 
 @pytest.fixture
 def model_id():
-    return "/data/a5-alignment/models/Qwen2.5-Math-1.5B"
+    return os.environ.get(
+        "TOKENIZER_MODEL_ID",
+        "/data/a5-alignment/models/Qwen2.5-Math-1.5B",
+    )
 
 
 @pytest.fixture
