@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import gc
+import os
+import tempfile
+from pathlib import Path
+from typing import Any, Iterator
+
 import torch
 import torch.nn as nn
+import typer
+from datasets import Dataset, load_from_disk
 from torch import Tensor
-from transformers import PreTrainedTokenizerBase
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
 
 
 def tokenize_prompt_and_output(
@@ -94,6 +102,8 @@ def get_response_log_probs(
     input_ids: Tensor,
     labels: Tensor,
     return_token_entropy: bool = False,
+    *,
+    for_training: bool = False,
 ) -> dict[str, Tensor]:
     """Per-token log p(label_t | x_{≤t}) from causal LM logits, optional entropy per step.
 
@@ -107,6 +117,8 @@ def get_response_log_probs(
         input_ids: Context tokens, shape ``(batch, seq)``.
         labels: Target token ids aligned with each step, shape ``(batch, seq)``.
         return_token_entropy: If True, include ``token_entropy`` via :func:`compute_entropy`.
+        for_training: If True, run a differentiable forward (no ``no_grad``); leave the model in
+            training mode. If False (default), match unit-test behavior (eval + no grad).
 
     Returns:
         ``log_probs`` shape ``(batch, seq)``. If ``return_token_entropy``, also ``token_entropy``
@@ -116,14 +128,17 @@ def get_response_log_probs(
     x = input_ids.to(device)
     y = labels.to(device)
 
-    was_training = model.training
-    model.eval()
-    try:
-        with torch.no_grad():
-            logits = model(x).logits
-    finally:
-        if was_training:
-            model.train()
+    if for_training:
+        logits = model(x).logits
+    else:
+        was_training = model.training
+        model.eval()
+        try:
+            with torch.no_grad():
+                logits = model(x).logits
+        finally:
+            if was_training:
+                model.train()
 
     log_probs_v = torch.log_softmax(logits, dim=-1)
     vocab = logits.size(-1)
@@ -195,3 +210,336 @@ def sft_microbatch_train_step(
 
     loss.backward()
     return loss, metadata
+
+
+# --- Intellect SFT dataset & batching -------------------------------------------------
+
+
+def _messages_to_prompt_and_output(messages: list[dict[str, str]]) -> tuple[str, str]:
+    sys_msg = next((m["content"] for m in messages if m.get("role") == "system"), "")
+    user_msg = next((m["content"] for m in messages if m.get("role") == "user"), "")
+    assistant_msg = next((m["content"] for m in messages if m.get("role") == "assistant"), "")
+    prompt = sys_msg + "\n\n" + user_msg if sys_msg else user_msg
+    return prompt, assistant_msg
+
+
+def load_prime_intellect(
+    train_path: str | Path,
+    max_examples: int | None,
+) -> Dataset:
+    """Load Prime Intellect-style SFT data (``messages`` + ``ground_truth``) from disk."""
+    path = Path(train_path)
+    ds: Dataset = load_from_disk(str(path))
+    if max_examples is not None and max_examples < len(ds):
+        ds = ds.select(range(max_examples))
+    return ds
+
+
+def sample_batch(dataset: Dataset, batch_size: int, *, generator: torch.Generator | None = None) -> dict[str, list[str]]:
+    """Sample a batch of (prompt, assistant output) string pairs."""
+    n = len(dataset)
+    if n == 0:
+        raise ValueError("dataset is empty")
+    idx = torch.randint(0, n, (batch_size,), generator=generator)
+    prompts: list[str] = []
+    outputs: list[str] = []
+    for i in idx.tolist():
+        row = dataset[int(i)]
+        p, o = _messages_to_prompt_and_output(row["messages"])
+        prompts.append(p)
+        outputs.append(o)
+    return {"prompts": prompts, "outputs": outputs}
+
+
+def get_microbatches(
+    batch: dict[str, list[str]],
+    gradient_accumulation_steps: int,
+) -> Iterator[dict[str, list[str]]]:
+    """Split a batch into up to ``gradient_accumulation_steps`` contiguous microbatches."""
+    prompts = batch["prompts"]
+    outputs = batch["outputs"]
+    n = len(prompts)
+    if gradient_accumulation_steps <= 0:
+        raise ValueError("gradient_accumulation_steps must be positive")
+    n_mb = min(gradient_accumulation_steps, max(n, 1))
+    chunk = (n + n_mb - 1) // n_mb
+    start = 0
+    while start < n:
+        end = min(start + chunk, n)
+        yield {"prompts": prompts[start:end], "outputs": outputs[start:end]}
+        start = end
+
+
+# --- vLLM eval ------------------------------------------------------------------------
+
+
+def init_vllm(model_id: str, device: str | None = None, seed: int = 42, **kwargs: Any) -> Any:
+    """Construct a vLLM ``LLM`` for periodic eval. Extra kwargs are forwarded to ``LLM(...)``.
+
+    Note:
+        Pinning vLLM to a specific GPU (e.g. ``cuda:1``) while training on ``cuda:0`` is
+        environment-dependent; set ``CUDA_VISIBLE_DEVICES`` appropriately or pass vLLM-supported
+        engine args via ``kwargs``.
+    """
+    from vllm import LLM
+
+    if device is not None:
+        os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
+    llm_kw: dict[str, Any] = {
+        "trust_remote_code": True,
+        "dtype": "bfloat16",
+        "seed": seed,
+        "gpu_memory_utilization": kwargs.pop("gpu_memory_utilization", 0.9),
+        **kwargs,
+    }
+    llm = LLM(model=model_id, **llm_kw)
+    reload_kw = {k: v for k, v in llm_kw.items()}
+    setattr(llm, "_sft_vllm_reload_kw", reload_kw)
+    return llm
+
+
+def load_policy_into_vllm_instance(
+    policy: nn.Module,
+    tokenizer: PreTrainedTokenizerBase,
+    llm: Any,
+) -> Any:
+    """Save the HF policy to a temp dir and rebuild vLLM from those weights.
+
+    Returns the new ``LLM`` instance; callers must reassign their handle, e.g.
+    ``llm = load_policy_into_vllm_instance(policy, tokenizer, llm)``.
+    """
+    from vllm import LLM
+
+    reload_kw: dict[str, Any] = getattr(llm, "_sft_vllm_reload_kw", {"trust_remote_code": True, "dtype": "bfloat16"})
+    tmp = Path(tempfile.mkdtemp(prefix="sft_vllm_ckpt_"))
+    policy.save_pretrained(tmp)
+    tokenizer.save_pretrained(tmp)
+    del llm
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    new_llm = LLM(model=str(tmp), **reload_kw)
+    setattr(new_llm, "_sft_vllm_reload_kw", reload_kw)
+    return new_llm
+
+
+def evaluate_on_math_val(
+    llm: Any,
+    tokenizer: PreTrainedTokenizerBase,
+    val_path: str | Path,
+    max_examples: int | None = 500,
+) -> float:
+    """Intellect-style validation accuracy using :func:`question_only_reward_fn`."""
+    from vllm import SamplingParams
+
+    from .drgrpo_grader import question_only_reward_fn
+
+    _ = tokenizer
+    ds = load_from_disk(str(val_path))
+    if max_examples is not None and max_examples < len(ds):
+        ds = ds.select(range(max_examples))
+    prompts: list[str] = []
+    gts: list[str] = []
+    for ex in ds:
+        msgs = ex.get("messages", [])
+        sys_msg = next((m["content"] for m in msgs if m.get("role") == "system"), "")
+        user_msg = next((m["content"] for m in msgs if m.get("role") == "user"), "")
+        prompts.append(sys_msg + "\n\n" + user_msg if sys_msg else user_msg)
+        gts.append(ex.get("ground_truth", ""))
+    params = SamplingParams(temperature=0.0, max_tokens=2048)
+    outputs = llm.generate(prompts, params)
+    correct = 0
+    for i, out in enumerate(outputs):
+        text = out.outputs[0].text
+        correct += int(question_only_reward_fn(text, gts[i])["reward"])
+    return correct / max(len(outputs), 1)
+
+
+# --- Full training loop & CLI ---------------------------------------------------------
+
+
+def run_sft_training_run(
+    *,
+    model_id: str,
+    train_path: Path,
+    val_path: Path,
+    output_root: Path,
+    max_train_examples: int | None,
+    n_sft_steps: int,
+    batch_size: int,
+    gradient_accumulation_steps: int,
+    lr: float,
+    eval_every: int,
+    max_eval_examples: int | None,
+    policy_device: str,
+    use_wandb: bool,
+    wandb_project: str,
+    wandb_run_name: str | None,
+    seed: int,
+) -> None:
+    """One training run for a fixed training subset size (``max_train_examples``)."""
+    torch.manual_seed(seed)
+    gen = torch.Generator()
+    gen.manual_seed(seed)
+
+    device = torch.device(policy_device)
+    policy = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+    ).to(device)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    dataset = load_prime_intellect(train_path, max_train_examples)
+    n_tag = "full" if max_train_examples is None else str(max_train_examples)
+    save_dir = output_root / f"sft_n{n_tag}"
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=lr)
+    llm = init_vllm(model_id, seed=seed)
+
+    wb: Any = None
+    if use_wandb:
+        import wandb as wb_mod
+
+        wb = wb_mod
+        wb.init(
+            project=wandb_project,
+            name=wandb_run_name or f"sft_n{n_tag}",
+            config={
+                "model_id": model_id,
+                "max_train_examples": max_train_examples,
+                "n_sft_steps": n_sft_steps,
+                "batch_size": batch_size,
+                "gradient_accumulation_steps": gradient_accumulation_steps,
+                "lr": lr,
+                "eval_every": eval_every,
+            },
+            reinit=True,
+        )
+        wb.define_metric("train_step")
+        wb.define_metric("eval_step")
+        wb.define_metric("train/*", step_metric="train_step")
+        wb.define_metric("eval/*", step_metric="eval_step")
+
+    train_step = 0
+    policy.train()
+    use_amp = device.type == "cuda"
+
+    n_examples = "full" if max_train_examples is None else max_train_examples
+    print(f"Starting SFT run: n_examples={n_examples}, lr={lr}", flush=True)
+
+    try:
+        for _step in range(n_sft_steps):
+            optimizer.zero_grad(set_to_none=True)
+            batch = sample_batch(dataset, batch_size, generator=gen)
+
+            for micro in get_microbatches(batch, gradient_accumulation_steps):
+                tokens = tokenize_prompt_and_output(
+                    micro["prompts"], micro["outputs"], tokenizer
+                )
+                input_ids = tokens["input_ids"].to(device)
+                labels = tokens["labels"].to(device)
+                mask = tokens["response_mask"].to(device)
+
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
+                    log_probs = get_response_log_probs(
+                        policy,
+                        input_ids,
+                        labels,
+                        for_training=True,
+                    )["log_probs"]
+                loss, _meta = sft_microbatch_train_step(
+                    log_probs,
+                    mask,
+                    gradient_accumulation_steps,
+                )
+                if wb is not None and wb.run is not None:
+                    wb.log({"train/loss": float(loss.detach()), "train_step": train_step})
+
+            print(f"[step {train_step}] loss={float(loss.detach()):.4f}", flush=True)
+
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+            optimizer.step()
+            train_step += 1
+
+            if train_step % eval_every == 0:
+                policy.eval()
+                llm = load_policy_into_vllm_instance(policy, tokenizer, llm)
+                acc = evaluate_on_math_val(
+                    llm, tokenizer, val_path, max_examples=max_eval_examples
+                )
+                print(f"[eval step {train_step}] accuracy={acc:.4f}", flush=True)
+                if wb is not None and wb.run is not None:
+                    wb.log({"eval/accuracy": acc, "eval_step": train_step})
+                policy.train()
+    except Exception as e:
+        print(f"CRASH: {e}", flush=True)
+        raise
+
+    policy.save_pretrained(save_dir)
+    tokenizer.save_pretrained(save_dir)
+    if wb is not None and wb.run is not None:
+        wb.finish()
+
+
+app = typer.Typer(add_completion=False, help="Intellect SFT training (5 dataset sizes + wandb).")
+
+
+@app.command()
+def train(
+    model_id: str = typer.Option("Qwen/Qwen2.5-Math-1.5B", help="HF model id or local path"),
+    train_path: Path = typer.Option(
+        Path("data-distrib/intellect_math/train"),
+        help="HuggingFace ``datasets`` disk path (train)",
+    ),
+    val_path: Path = typer.Option(
+        Path("data-distrib/intellect_math/dev"),
+        help="Validation set path (Intellect dev)",
+    ),
+    output_root: Path = typer.Option(
+        Path(os.environ.get("SFT_OUTPUT_ROOT", "./sft_checkpoints")),
+        help="Directory for per-run ``sft_n*`` saves",
+    ),
+    n_sft_steps: int = typer.Option(100, help="Optimizer steps per dataset-size experiment"),
+    batch_size: int = typer.Option(4, help="Samples per optimizer step (before microbatch split)"),
+    gradient_accumulation_steps: int = typer.Option(2, help="Microbatches per optimizer step"),
+    lr: float = typer.Option(1e-5, help="AdamW learning rate"),
+    eval_every: int = typer.Option(10, help="Run vLLM eval every N train steps"),
+    policy_device: str = typer.Option("cuda:0", help="Device for HF policy training"),
+    max_eval_examples: int = typer.Option(500, help="Cap validation examples per eval"),
+    seed: int = typer.Option(42),
+    wandb_project: str = typer.Option("intellect-sft", help="Weights & Biases project"),
+    no_wandb: bool = typer.Option(False, help="Disable wandb logging"),
+) -> None:
+    """Run five experiments with N ∈ {128, 256, 512, 1024, full train set}."""
+    dataset_sizes: tuple[int | None, ...] = (128, 256, 512, 1024, None)
+    for n in dataset_sizes:
+        run_sft_training_run(
+            model_id=model_id,
+            train_path=train_path,
+            val_path=val_path,
+            output_root=output_root,
+            max_train_examples=n,
+            n_sft_steps=n_sft_steps,
+            batch_size=batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            lr=lr,
+            eval_every=eval_every,
+            max_eval_examples=max_eval_examples,
+            policy_device=policy_device,
+            use_wandb=not no_wandb,
+            wandb_project=wandb_project,
+            wandb_run_name=None,
+            seed=seed,
+        )
+
+
+def main() -> None:
+    app()
+
+
+if __name__ == "__main__":
+    main()
