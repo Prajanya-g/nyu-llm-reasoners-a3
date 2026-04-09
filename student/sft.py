@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn as nn
 from torch import Tensor
 from transformers import PreTrainedTokenizerBase
 
@@ -86,3 +87,50 @@ def compute_entropy(logits: Tensor) -> Tensor:
     log_norm = torch.logsumexp(logits, dim=-1, keepdim=True)
     probs = torch.exp(logits - log_norm)
     return torch.special.entr(probs).sum(dim=-1)
+
+
+def get_response_log_probs(
+    model: nn.Module,
+    input_ids: Tensor,
+    labels: Tensor,
+    return_token_entropy: bool = False,
+) -> dict[str, Tensor]:
+    """Per-token log p(label_t | x_{≤t}) from causal LM logits, optional entropy per step.
+
+    Uses ``model(input_ids).logits`` (shape ``batch × seq × vocab``). At time step ``t`` the
+    row ``logits[:, t]`` is the next-token distribution after consuming ``input_ids[:, : t+1]``;
+    the assignment ``labels`` tensor supplies the target id at each position (same length as
+    ``input_ids``). Negative labels (e.g. padding ignored in loss) are clamped for ``gather``.
+
+    Args:
+        model: HF causal LM (already on the intended device).
+        input_ids: Context tokens, shape ``(batch, seq)``.
+        labels: Target token ids aligned with each step, shape ``(batch, seq)``.
+        return_token_entropy: If True, include ``token_entropy`` via :func:`compute_entropy`.
+
+    Returns:
+        ``log_probs`` shape ``(batch, seq)``. If ``return_token_entropy``, also ``token_entropy``
+        with the same shape.
+    """
+    device = next(model.parameters()).device
+    x = input_ids.to(device)
+    y = labels.to(device)
+
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            logits = model(x).logits
+    finally:
+        if was_training:
+            model.train()
+
+    log_probs_v = torch.log_softmax(logits, dim=-1)
+    vocab = logits.size(-1)
+    idx = y.long().clamp(min=0, max=vocab - 1)
+    token_log_probs = log_probs_v.gather(-1, idx.unsqueeze(-1)).squeeze(-1)
+
+    out: dict[str, Tensor] = {"log_probs": token_log_probs}
+    if return_token_entropy:
+        out["token_entropy"] = compute_entropy(logits)
+    return out
