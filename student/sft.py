@@ -157,3 +157,43 @@ def masked_normalize(
     if dim is None:
         return weighted.sum() / normalize_constant
     return weighted.sum(dim=dim) / normalize_constant
+
+
+def sft_microbatch_train_step(
+    policy_log_probs: Tensor,
+    response_mask: Tensor,
+    gradient_accumulation_steps: int,
+    normalize_constant: float = 1.0,
+) -> tuple[Tensor, dict[str, Tensor]]:
+    """Masked token NLL for SFT, scaled for logging and gradient accumulation, then ``backward``.
+
+    Loss is :math:`\\sum_{t} -\\log p_t` over response positions (mask), divided by
+    ``normalize_constant`` and ``gradient_accumulation_steps`` so accumulated microbatch
+    gradients match one full-batch step.
+
+    Args:
+        policy_log_probs: Per-step log-probabilities of the labeled token, shape ``(B, T)``.
+        response_mask: Same shape; 1 for supervised response positions.
+        gradient_accumulation_steps: Microbatches per optimizer step (divisor for loss / grads).
+        normalize_constant: Extra divisor (e.g. sequence/token normalizer).
+
+    Returns:
+        Scalar ``loss`` tensor (for logging) and optional ``metadata`` tensors.
+    """
+    if policy_log_probs.grad is not None:
+        policy_log_probs.grad.zero_()
+
+    mask = response_mask.to(dtype=policy_log_probs.dtype)
+    # Per-token negative log-likelihood; cross-entropy with hard labels is -log p(y).
+    token_nll = -policy_log_probs
+    denom = normalize_constant * float(gradient_accumulation_steps)
+    loss = masked_normalize(token_nll, mask, denom, dim=None)
+
+    masked_nll_sum = (token_nll * mask).sum()
+    metadata: dict[str, Tensor] = {
+        "masked_nll_sum": masked_nll_sum.detach(),
+        "num_response_tokens": mask.sum().detach(),
+    }
+
+    loss.backward()
+    return loss, metadata
