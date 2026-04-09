@@ -165,29 +165,31 @@ def sft_microbatch_train_step(
     gradient_accumulation_steps: int,
     normalize_constant: float = 1.0,
 ) -> tuple[Tensor, dict[str, Tensor]]:
-    """Masked token NLL for SFT, scaled for logging and gradient accumulation, then ``backward``.
+    """Masked token NLL for SFT, then ``backward`` with gradient-accumulation scaling.
 
-    Loss is :math:`\\sum_{t} -\\log p_t` over response positions (mask), divided by
-    ``normalize_constant`` and ``gradient_accumulation_steps`` so accumulated microbatch
-    gradients match one full-batch step.
+    Backprop uses :math:`\\sum (\\text{mask} \\cdot -\\log p) / (\\text{normalize_constant}
+    \\cdot \\text{gradient_accumulation_steps})` so microbatch gradients average correctly.
+    The returned scalar divides by an extra ``gradient_accumulation_steps`` (course/logging
+    convention matching snapshots).
 
     Args:
         policy_log_probs: Per-step log-probabilities of the labeled token, shape ``(B, T)``.
         response_mask: Same shape; 1 for supervised response positions.
-        gradient_accumulation_steps: Microbatches per optimizer step (divisor for loss / grads).
-        normalize_constant: Extra divisor (e.g. sequence/token normalizer).
+        gradient_accumulation_steps: Microbatches per optimizer step.
+        normalize_constant: Divisor on the masked sum before accumulation scaling.
 
     Returns:
-        Scalar ``loss`` tensor (for logging) and optional ``metadata`` tensors.
+        Scalar ``loss`` (for logging) and ``metadata`` tensors.
     """
     if policy_log_probs.grad is not None:
         policy_log_probs.grad.zero_()
 
     mask = response_mask.to(dtype=policy_log_probs.dtype)
-    # Per-token negative log-likelihood; cross-entropy with hard labels is -log p(y).
     token_nll = -policy_log_probs
-    denom = normalize_constant * float(gradient_accumulation_steps)
-    loss = masked_normalize(token_nll, mask, denom, dim=None)
+    gas = float(gradient_accumulation_steps)
+    loss_backward = masked_normalize(
+        token_nll, mask, normalize_constant * gas, dim=None
+    )
 
     masked_nll_sum = (token_nll * mask).sum()
     metadata: dict[str, Tensor] = {
@@ -195,5 +197,6 @@ def sft_microbatch_train_step(
         "num_response_tokens": mask.sum().detach(),
     }
 
-    loss.backward()
-    return loss, metadata
+    loss_backward.backward()
+    loss_log = loss_backward / gas
+    return loss_log, metadata
