@@ -134,3 +134,26 @@ def get_response_log_probs(
     if return_token_entropy:
         out["token_entropy"] = compute_entropy(logits)
     return out
+
+
+def masked_normalize(
+    tensor: Tensor,
+    mask: Tensor,
+    normalize_constant: float,
+    dim: int | None = None,
+) -> Tensor:
+    """Sum selected elements (``mask == 1``) and divide by ``normalize_constant``.
+
+    Args:
+        tensor: Values to sum.
+        mask: Same shape as ``tensor``; ones select entries, zeros are ignored.
+        normalize_constant: Divisor applied after summing.
+        dim: Dimension to sum along, or ``None`` to sum every element.
+
+    Returns:
+        Normalized sum tensor with summed dimensions removed when ``dim`` is set.
+    """
+    weighted = tensor * mask.to(dtype=tensor.dtype)
+    if dim is None:
+        return weighted.sum() / normalize_constant
+    return weighted.sum(dim=dim) / normalize_constant
