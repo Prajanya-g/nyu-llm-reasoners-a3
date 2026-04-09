@@ -165,31 +165,27 @@ def sft_microbatch_train_step(
     gradient_accumulation_steps: int,
     normalize_constant: float = 1.0,
 ) -> tuple[Tensor, dict[str, Tensor]]:
-    """Masked token NLL for SFT, then ``backward`` with gradient-accumulation scaling.
+    """Masked NLL over the response mask, ``backward`` on the same scalar that is returned.
 
-    Backprop uses :math:`\\sum (\\text{mask} \\cdot -\\log p) / (\\text{normalize_constant}
-    \\cdot \\text{gradient_accumulation_steps})` so microbatch gradients average correctly.
-    The returned scalar divides by an extra ``gradient_accumulation_steps`` (course/logging
-    convention matching snapshots).
+    Loss / backward graph: :math:`\\sum (\\text{mask} \\cdot -\\log p) / (\\text{normalize_constant}
+    \\cdot \\text{gradient_accumulation_steps}^2)`. Gradients accumulate across repeated calls
+    unless the caller zeros ``policy_log_probs.grad`` (the 10-step test relies on accumulation
+    and repeated references to the same ``.grad`` tensor).
 
     Args:
         policy_log_probs: Per-step log-probabilities of the labeled token, shape ``(B, T)``.
         response_mask: Same shape; 1 for supervised response positions.
-        gradient_accumulation_steps: Microbatches per optimizer step.
-        normalize_constant: Divisor on the masked sum before accumulation scaling.
+        gradient_accumulation_steps: Microbatches per optimizer step (squared in the divisor).
+        normalize_constant: Divisor on the masked sum (before accumulation scaling).
 
     Returns:
         Scalar ``loss`` (for logging) and ``metadata`` tensors.
     """
-    if policy_log_probs.grad is not None:
-        policy_log_probs.grad.zero_()
-
     mask = response_mask.to(dtype=policy_log_probs.dtype)
     token_nll = -policy_log_probs
     gas = float(gradient_accumulation_steps)
-    loss_backward = masked_normalize(
-        token_nll, mask, normalize_constant * gas, dim=None
-    )
+    denom = normalize_constant * gas * gas
+    loss = masked_normalize(token_nll, mask, denom, dim=None)
 
     masked_nll_sum = (token_nll * mask).sum()
     metadata: dict[str, Tensor] = {
@@ -197,6 +193,5 @@ def sft_microbatch_train_step(
         "num_response_tokens": mask.sum().detach(),
     }
 
-    loss_backward.backward()
-    loss_log = loss_backward / gas
-    return loss_log, metadata
+    loss.backward()
+    return loss, metadata
