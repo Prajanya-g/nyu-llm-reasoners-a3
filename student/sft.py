@@ -388,6 +388,10 @@ def run_sft_training_run(
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
     ).to(device)
+    torch.ones(1).to(policy_device)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    print("GPU warmed up", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token = tokenizer.eos_token
