@@ -446,6 +446,13 @@ def run_sft_training_run(
     )
 
     optimizer = torch.optim.AdamW(policy.parameters(), lr=lr)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+        dev_idx = device.index if device.index is not None else 0
+        print(
+            f"Model memory: {torch.cuda.memory_allocated(dev_idx) / 1e9:.1f}GB",
+            flush=True,
+        )
     log.info("Initializing vLLM for periodic eval (model_id=%s)", model_id)
     t_vllm = time.perf_counter()
     llm = init_vllm(model_id, seed=seed)
