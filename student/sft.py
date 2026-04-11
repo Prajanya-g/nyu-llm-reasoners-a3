@@ -314,7 +314,7 @@ def init_vllm(
     model_id: str,
     device: str = "cuda:1",
     seed: int = 42,
-    gpu_memory_utilization: float = 0.85,
+    gpu_memory_utilization: float = 0.6,
     **kwargs: Any,
 ) -> Any:
     """Construct a vLLM ``LLM`` for periodic eval on ``device`` (default ``cuda:1``).
@@ -356,7 +356,7 @@ def load_policy_into_vllm_instance(
             "trust_remote_code": True,
             "dtype": "bfloat16",
             "device": "cuda:1",
-            "gpu_memory_utilization": 0.85,
+            "gpu_memory_utilization": 0.6,
         },
     )
     tmp = Path(tempfile.mkdtemp(prefix="sft_vllm_ckpt_"))
@@ -421,6 +421,7 @@ def run_sft_training_run(
     max_eval_examples: int | None,
     policy_device: str,
     vllm_device: str,
+    vllm_gpu_memory_utilization: float = 0.6,
     use_wandb: bool,
     wandb_project: str,
     wandb_run_name: str | None,
@@ -453,12 +454,13 @@ def run_sft_training_run(
     save_dir.mkdir(parents=True, exist_ok=True)
 
     log.info(
-        "Run config | model_id=%s policy_device=%s vllm_device=%s train_path=%s val_path=%s "
-        "n_train=%d n_sft_steps=%d batch_size=%d grad_acc=%d lr=%g eval_every=%d "
-        "max_eval_examples=%s save_dir=%s wandb=%s",
+        "Run config | model_id=%s policy_device=%s vllm_device=%s vllm_gpu_mem=%.3f "
+        "train_path=%s val_path=%s n_train=%d n_sft_steps=%d batch_size=%d grad_acc=%d lr=%g "
+        "eval_every=%d max_eval_examples=%s save_dir=%s wandb=%s",
         model_id,
         policy_device,
         vllm_device,
+        vllm_gpu_memory_utilization,
         train_path,
         val_path,
         len(dataset),
@@ -486,7 +488,12 @@ def run_sft_training_run(
         vllm_device,
     )
     t_vllm = time.perf_counter()
-    llm = init_vllm(model_id, device=vllm_device, seed=seed, gpu_memory_utilization=0.85)
+    llm = init_vllm(
+        model_id,
+        device=vllm_device,
+        seed=seed,
+        gpu_memory_utilization=vllm_gpu_memory_utilization,
+    )
     log.info("vLLM ready (%.1fs)", time.perf_counter() - t_vllm)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -521,6 +528,7 @@ def run_sft_training_run(
                 "lr": lr,
                 "eval_every": eval_every,
                 "vllm_device": vllm_device,
+                "vllm_gpu_memory_utilization": vllm_gpu_memory_utilization,
             },
             reinit=True,
         )
@@ -643,6 +651,10 @@ def train(
         "cuda:1",
         help="CUDA device string passed to vLLM EngineArgs (keep off policy GPU, e.g. cuda:1)",
     ),
+    vllm_gpu_memory_utilization: float = typer.Option(
+        0.6,
+        help="vLLM gpu_memory_utilization (fraction of GPU memory for weights + KV cache)",
+    ),
     max_eval_examples: int = typer.Option(500, help="Cap validation examples per eval"),
     seed: int = typer.Option(42),
     wandb_project: str = typer.Option("intellect-sft", help="Weights & Biases project"),
@@ -678,6 +690,7 @@ def train(
             max_eval_examples=max_eval_examples,
             policy_device=policy_device,
             vllm_device=vllm_device,
+            vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
             use_wandb=not no_wandb,
             wandb_project=wandb_project,
             wandb_run_name=None,
