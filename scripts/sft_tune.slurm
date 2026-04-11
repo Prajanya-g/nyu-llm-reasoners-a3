@@ -21,6 +21,8 @@ cd "${REPO_ROOT}" || exit 1
 uv run python -m student.sft train \
   --output-root "${OUT_ROOT}" \
   --wandb-project intellect-sft \
+  --policy-device cuda:0 \
+  --vllm-device cuda:1 \
   --lr "${LR}" \
   --n-sft-steps 100 \
   --eval-every 10 \
