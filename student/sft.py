@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import gc
 import logging
 import os
-import tempfile
 import time
 from pathlib import Path
 from typing import Any, Iterator
@@ -17,7 +15,12 @@ import torch.nn.functional as F
 import typer
 from datasets import Dataset, load_from_disk
 from torch import Tensor
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    PreTrainedModel,
+    PreTrainedTokenizerBase,
+)
 
 log = logging.getLogger(__name__)
 
@@ -339,36 +342,16 @@ def init_vllm(
     return llm
 
 
-def load_policy_into_vllm_instance(
-    policy: nn.Module,
-    tokenizer: PreTrainedTokenizerBase,
-    llm: Any,
-) -> Any:
-    """Save the HF policy to a temp dir and rebuild vLLM from those weights.
+def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: Any) -> Any:
+    """Copy HF ``policy`` weights into the existing vLLM engine (no second ``LLM`` allocation).
 
-    Returns the new ``LLM`` instance; callers must reassign their handle, e.g.
-    ``llm = load_policy_into_vllm_instance(policy, tokenizer, llm)``.
+    Mutates the runner model in place so eval uses updated weights without peak VRAM from
+    two concurrent vLLM instances on the same GPU.
     """
-    reload_kw: dict[str, Any] = getattr(
-        llm,
-        "_sft_vllm_reload_kw",
-        {
-            "trust_remote_code": True,
-            "dtype": "bfloat16",
-            "device": "cuda:1",
-            "gpu_memory_utilization": 0.6,
-        },
-    )
-    tmp = Path(tempfile.mkdtemp(prefix="sft_vllm_ckpt_"))
-    policy.save_pretrained(tmp)
-    tokenizer.save_pretrained(tmp)
-    del llm
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    new_llm = _vllm_llm_construct(str(tmp), reload_kw)
-    setattr(new_llm, "_sft_vllm_reload_kw", reload_kw)
-    return new_llm
+    state_dict = policy.state_dict()
+    llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+    llm_model.load_weights(state_dict.items())
+    return llm
 
 
 def evaluate_on_math_val(
@@ -589,7 +572,7 @@ def run_sft_training_run(
                 policy.eval()
                 log.info("eval | reloading vLLM weights train_step=%d", train_step)
                 t0 = time.perf_counter()
-                llm = load_policy_into_vllm_instance(policy, tokenizer, llm)
+                load_policy_into_vllm_instance(policy, llm)
                 log.info("eval | vLLM reload done (%.1fs)", time.perf_counter() - t0)
                 t1 = time.perf_counter()
                 acc = evaluate_on_math_val(
