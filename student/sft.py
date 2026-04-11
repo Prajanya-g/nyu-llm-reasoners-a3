@@ -12,6 +12,7 @@ from typing import Any, Iterator
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import typer
 from datasets import Dataset, load_from_disk
 from torch import Tensor
@@ -124,15 +125,15 @@ def get_response_log_probs(
 ) -> dict[str, Tensor]:
     """Per-token log p(label_t | x_{≤t}) from causal LM logits, optional entropy per step.
 
-    Uses ``model(input_ids).logits`` (shape ``batch × seq × vocab``). At time step ``t`` the
-    row ``logits[:, t]`` is the next-token distribution after consuming ``input_ids[:, : t+1]``;
-    the assignment ``labels`` tensor supplies the target id at each position (same length as
-    ``input_ids``). Negative labels (e.g. padding ignored in loss) are clamped for ``gather``.
+    Uses ``model(input_ids).logits`` (shape ``batch × seq × vocab``). Log-probs for the labeled
+    token use fused :func:`torch.nn.functional.cross_entropy` on a flattened batch so PyTorch
+    never materializes a full ``(batch, seq, vocab)`` ``log_softmax`` tensor (saves VRAM).
 
     Args:
         model: HF causal LM (already on the intended device).
         input_ids: Context tokens, shape ``(batch, seq)``.
-        labels: Target token ids aligned with each step, shape ``(batch, seq)``.
+        labels: Target token ids per step, shape ``(batch, seq)``; clamped to
+            ``[0, vocab_size - 1]`` where invalid (same as the old gather path).
         return_token_entropy: If True, include ``token_entropy`` via :func:`compute_entropy`.
         for_training: If True, run a differentiable forward (no ``no_grad``); leave the model in
             training mode. If False (default), match unit-test behavior (eval + no grad).
@@ -157,10 +158,15 @@ def get_response_log_probs(
             if was_training:
                 model.train()
 
-    log_probs_v = torch.log_softmax(logits, dim=-1)
     vocab = logits.size(-1)
-    idx = y.long().clamp(min=0, max=vocab - 1)
-    token_log_probs = log_probs_v.gather(-1, idx.unsqueeze(-1)).squeeze(-1)
+    y_flat = y.long().clamp(min=0, max=vocab - 1).view(-1)
+    token_log_probs = (
+        -F.cross_entropy(
+            logits.view(-1, vocab),
+            y_flat,
+            reduction="none",
+        )
+    ).view(y.shape)
 
     out: dict[str, Tensor] = {"log_probs": token_log_probs}
     if return_token_entropy:
