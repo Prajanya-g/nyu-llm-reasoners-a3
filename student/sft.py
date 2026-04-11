@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import gc
+import logging
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -14,6 +16,21 @@ import typer
 from datasets import Dataset, load_from_disk
 from torch import Tensor
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
+
+log = logging.getLogger(__name__)
+
+
+def _configure_run_logging(level: str) -> None:
+    """Console logging for training CLI (idempotent if handlers already exist)."""
+    lvl = getattr(logging, level.upper(), logging.INFO)
+    if not logging.root.handlers:
+        logging.basicConfig(
+            level=lvl,
+            format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    logging.getLogger().setLevel(lvl)
+    log.setLevel(lvl)
 
 
 def tokenize_prompt_and_output(
@@ -388,10 +405,12 @@ def run_sft_training_run(
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
     ).to(device)
+    policy.gradient_checkpointing_enable()
+    log.info("Gradient checkpointing enabled (trades compute for activation memory)")
     torch.ones(1).to(policy_device)
     if device.type == "cuda":
         torch.cuda.synchronize()
-    print("GPU warmed up", flush=True)
+    log.info("GPU warmed up (policy_device=%s)", policy_device)
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -401,8 +420,30 @@ def run_sft_training_run(
     save_dir = output_root / f"sft_n{n_tag}"
     save_dir.mkdir(parents=True, exist_ok=True)
 
+    log.info(
+        "Run config | model_id=%s device=%s train_path=%s val_path=%s "
+        "n_train=%d n_sft_steps=%d batch_size=%d grad_acc=%d lr=%g eval_every=%d "
+        "max_eval_examples=%s save_dir=%s wandb=%s",
+        model_id,
+        policy_device,
+        train_path,
+        val_path,
+        len(dataset),
+        n_sft_steps,
+        batch_size,
+        gradient_accumulation_steps,
+        lr,
+        eval_every,
+        max_eval_examples,
+        save_dir,
+        use_wandb,
+    )
+
     optimizer = torch.optim.AdamW(policy.parameters(), lr=lr)
+    log.info("Initializing vLLM for periodic eval (model_id=%s)", model_id)
+    t_vllm = time.perf_counter()
     llm = init_vllm(model_id, seed=seed)
+    log.info("vLLM ready (%.1fs)", time.perf_counter() - t_vllm)
 
     wb: Any = None
     if use_wandb:
@@ -427,13 +468,14 @@ def run_sft_training_run(
         wb.define_metric("eval_step")
         wb.define_metric("train/*", step_metric="train_step")
         wb.define_metric("eval/*", step_metric="eval_step")
+        log.info("wandb initialized project=%s run=%s", wandb_project, wandb_run_name or f"sft_n{n_tag}")
 
     train_step = 0
     policy.train()
     use_amp = device.type == "cuda"
 
     n_examples = "full" if max_train_examples is None else max_train_examples
-    print(f"Starting SFT run: n_examples={n_examples}, lr={lr}", flush=True)
+    log.info("Starting training loop | n_examples=%s lr=%g total_optimizer_steps=%d", n_examples, lr, n_sft_steps)
 
     try:
         for _step in range(n_sft_steps):
@@ -463,30 +505,48 @@ def run_sft_training_run(
                 if wb is not None and wb.run is not None:
                     wb.log({"train/loss": float(loss.detach()), "train_step": train_step})
 
-            print(f"[step {train_step}] loss={float(loss.detach()):.4f}", flush=True)
-
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+            grad_pre_clip = torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
             optimizer.step()
             train_step += 1
+            log.info(
+                "train | step=%d/%d train_step=%d loss=%.4f grad_norm=%.4f",
+                _step + 1,
+                n_sft_steps,
+                train_step,
+                float(loss.detach()),
+                float(grad_pre_clip),
+            )
 
             if train_step % eval_every == 0:
                 policy.eval()
+                log.info("eval | reloading vLLM weights train_step=%d", train_step)
+                t0 = time.perf_counter()
                 llm = load_policy_into_vllm_instance(policy, tokenizer, llm)
+                log.info("eval | vLLM reload done (%.1fs)", time.perf_counter() - t0)
+                t1 = time.perf_counter()
                 acc = evaluate_on_math_val(
                     llm, tokenizer, val_path, max_examples=max_eval_examples
                 )
-                print(f"[eval step {train_step}] accuracy={acc:.4f}", flush=True)
+                log.info(
+                    "eval | train_step=%d accuracy=%.4f (%.1fs)",
+                    train_step,
+                    acc,
+                    time.perf_counter() - t1,
+                )
                 if wb is not None and wb.run is not None:
                     wb.log({"eval/accuracy": acc, "eval_step": train_step})
                 policy.train()
-    except Exception as e:
-        print(f"CRASH: {e}", flush=True)
+    except Exception:
+        log.exception("Training crashed (n_examples=%s)", n_examples)
         raise
 
+    log.info("Saving checkpoint to %s", save_dir)
     policy.save_pretrained(save_dir)
     tokenizer.save_pretrained(save_dir)
+    log.info("Saved policy and tokenizer | n_examples=%s", n_examples)
     if wb is not None and wb.run is not None:
         wb.finish()
+        log.info("wandb run finished")
 
 
 app = typer.Typer(add_completion=False, help="Intellect SFT training (5 dataset sizes + wandb).")
@@ -508,8 +568,14 @@ def train(
         help="Directory for per-run ``sft_n*`` saves",
     ),
     n_sft_steps: int = typer.Option(100, help="Optimizer steps per dataset-size experiment"),
-    batch_size: int = typer.Option(4, help="Samples per optimizer step (before microbatch split)"),
-    gradient_accumulation_steps: int = typer.Option(2, help="Microbatches per optimizer step"),
+    batch_size: int = typer.Option(
+        2,
+        help="Samples per optimizer step (before microbatch split); use 2 with GC if 1.5B OOMs at 4",
+    ),
+    gradient_accumulation_steps: int = typer.Option(
+        4,
+        help="Microbatches per optimizer step (e.g. batch_size=2 × 4 ⇒ effective batch 8)",
+    ),
     lr: float = typer.Option(1e-5, help="AdamW learning rate"),
     eval_every: int = typer.Option(10, help="Run vLLM eval every N train steps"),
     policy_device: str = typer.Option("cuda:0", help="Device for HF policy training"),
@@ -517,10 +583,23 @@ def train(
     seed: int = typer.Option(42),
     wandb_project: str = typer.Option("intellect-sft", help="Weights & Biases project"),
     no_wandb: bool = typer.Option(False, help="Disable wandb logging"),
+    log_level: str = typer.Option(
+        "INFO",
+        help="Python logging level (DEBUG, INFO, WARNING, ERROR)",
+    ),
 ) -> None:
     """Run five experiments with N ∈ {128, 256, 512, 1024, full train set}."""
+    _configure_run_logging(log_level)
     dataset_sizes: tuple[int | None, ...] = (128, 256, 512, 1024, None)
-    for n in dataset_sizes:
+    log.info(
+        "Multi-run job | %d dataset sizes: %s | model_id=%s",
+        len(dataset_sizes),
+        [x if x is not None else "full" for x in dataset_sizes],
+        model_id,
+    )
+    for i, n in enumerate(dataset_sizes, start=1):
+        label = n if n is not None else "full"
+        log.info("=== Experiment %d/%d | max_train_examples=%s ===", i, len(dataset_sizes), label)
         run_sft_training_run(
             model_id=model_id,
             train_path=train_path,
@@ -539,6 +618,7 @@ def train(
             wandb_run_name=None,
             seed=seed,
         )
+    log.info("Multi-run job complete | all %d experiments finished", len(dataset_sizes))
 
 
 def main() -> None:
