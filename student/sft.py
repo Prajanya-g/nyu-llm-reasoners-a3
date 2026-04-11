@@ -9,6 +9,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any, Iterator
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
@@ -296,6 +297,19 @@ def get_microbatches(
 # --- vLLM eval ------------------------------------------------------------------------
 
 
+def _vllm_llm_construct(model: str, llm_kw: dict[str, Any]) -> Any:
+    """Instantiate vLLM ``LLM`` with patches that avoid profiling / distributed assumptions."""
+    from vllm import LLM
+
+    world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
+    profiling_patch = patch(
+        "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
+        return_value=None,
+    )
+    with world_size_patch, profiling_patch:
+        return LLM(model=model, **llm_kw)
+
+
 def init_vllm(
     model_id: str,
     device: str = "cuda:1",
@@ -306,11 +320,10 @@ def init_vllm(
     """Construct a vLLM ``LLM`` for periodic eval on ``device`` (default ``cuda:1``).
 
     vLLM 0.7.x forwards ``device`` to ``EngineArgs`` so inference can use a different GPU than
-    the HF policy (typically policy on ``cuda:0``, vLLM on ``cuda:1``). Extra ``kwargs`` are
-    forwarded to ``LLM(...)`` after the explicit arguments.
+    the HF policy (typically policy on ``cuda:0``, vLLM on ``cuda:1``). The ``LLM(...)`` call is
+    wrapped in mocks so ``_assert_memory_footprint_increased_during_profiling`` is skipped when
+    another process holds most of ``cuda:0``. Extra ``kwargs`` are forwarded to ``LLM(...)``.
     """
-    from vllm import LLM
-
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
     llm_kw: dict[str, Any] = {
         "trust_remote_code": True,
@@ -320,7 +333,7 @@ def init_vllm(
         **kwargs,
         "device": device,
     }
-    llm = LLM(model=model_id, **llm_kw)
+    llm = _vllm_llm_construct(model_id, llm_kw)
     reload_kw = {k: v for k, v in llm_kw.items()}
     setattr(llm, "_sft_vllm_reload_kw", reload_kw)
     return llm
@@ -336,8 +349,6 @@ def load_policy_into_vllm_instance(
     Returns the new ``LLM`` instance; callers must reassign their handle, e.g.
     ``llm = load_policy_into_vllm_instance(policy, tokenizer, llm)``.
     """
-    from vllm import LLM
-
     reload_kw: dict[str, Any] = getattr(
         llm,
         "_sft_vllm_reload_kw",
@@ -355,7 +366,7 @@ def load_policy_into_vllm_instance(
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    new_llm = LLM(model=str(tmp), **reload_kw)
+    new_llm = _vllm_llm_construct(str(tmp), reload_kw)
     setattr(new_llm, "_sft_vllm_reload_kw", reload_kw)
     return new_llm
 
