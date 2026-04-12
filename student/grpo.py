@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from torch import Tensor
@@ -100,6 +100,49 @@ def compute_grpo_clip_loss(
         "ratio": ratio.detach(),
     }
     return loss, metadata
+
+
+def compute_policy_gradient_loss(
+    policy_log_probs: Tensor,
+    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"],
+    raw_rewards: Tensor | None = None,
+    advantages: Tensor | None = None,
+    old_log_probs: Tensor | None = None,
+    cliprange: float | None = None,
+) -> tuple[Tensor, dict[str, Tensor]]:
+    """Dispatch to naive PG (reward or advantage) or GRPO-Clip; return per-token loss + metadata.
+
+    Args:
+        policy_log_probs: ``(batch_size, sequence_length)``.
+        loss_type: Which objective to use.
+        raw_rewards: ``(batch_size, 1)``, required for ``no_baseline``.
+        advantages: ``(batch_size, 1)``, required for ``reinforce_with_baseline`` and ``grpo_clip``.
+        old_log_probs: ``(batch_size, sequence_length)``, required for ``grpo_clip``.
+        cliprange: PPO/GRPO ratio clip ε, required for ``grpo_clip``.
+    """
+    if loss_type == "no_baseline":
+        if raw_rewards is None:
+            raise ValueError("raw_rewards is required when loss_type is 'no_baseline'")
+        loss = compute_naive_policy_gradient_loss(raw_rewards, policy_log_probs)
+        return loss, {}
+    if loss_type == "reinforce_with_baseline":
+        if advantages is None:
+            raise ValueError(
+                "advantages is required when loss_type is 'reinforce_with_baseline'"
+            )
+        loss = compute_naive_policy_gradient_loss(advantages, policy_log_probs)
+        return loss, {}
+    if loss_type == "grpo_clip":
+        if advantages is None:
+            raise ValueError("advantages is required when loss_type is 'grpo_clip'")
+        if old_log_probs is None:
+            raise ValueError("old_log_probs is required when loss_type is 'grpo_clip'")
+        if cliprange is None:
+            raise ValueError("cliprange is required when loss_type is 'grpo_clip'")
+        return compute_grpo_clip_loss(
+            advantages, policy_log_probs, old_log_probs, cliprange
+        )
+    raise ValueError(f"unknown loss_type: {loss_type!r}")
 
 
 def compute_naive_policy_gradient_loss(

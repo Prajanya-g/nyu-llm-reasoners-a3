@@ -12,6 +12,7 @@ from student.grpo import (
     compute_grpo_clip_loss,
     compute_group_normalized_rewards,
     compute_naive_policy_gradient_loss,
+    compute_policy_gradient_loss,
 )
 from student.sft import (
     compute_entropy,
@@ -198,16 +199,21 @@ def run_compute_grpo_clip_loss(
 
 def run_compute_policy_gradient_loss(
     policy_log_probs: torch.Tensor,
-    loss_type: str,
-    raw_rewards: torch.Tensor,
-    advantages: torch.Tensor,
-    old_log_probs: torch.Tensor,
-    cliprange: float,
+    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"],
+    raw_rewards: torch.Tensor | None = None,
+    advantages: torch.Tensor | None = None,
+    old_log_probs: torch.Tensor | None = None,
+    cliprange: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """
-    Wrapper that delegates to the appropriate policy gradient loss function above.
-    """
-    raise NotImplementedError
+    """Delegate to :func:`student.grpo.compute_policy_gradient_loss`."""
+    return compute_policy_gradient_loss(
+        policy_log_probs=policy_log_probs,
+        loss_type=loss_type,
+        raw_rewards=raw_rewards,
+        advantages=advantages,
+        old_log_probs=old_log_probs,
+        cliprange=cliprange,
+    )
 
 
 def run_masked_mean(tensor: torch.Tensor, mask: torch.Tensor, dim: int | None = None) -> torch.Tensor:
