@@ -313,7 +313,6 @@ def run_grpo_training(
                 optimizer.zero_grad(set_to_none=True)
                 last_loss: torch.Tensor | None = None
                 last_meta: dict[str, torch.Tensor] = {}
-                last_entropy: float | None = None
                 grad_norm: float = 0.0
 
                 for m in range(n_microbatches):
@@ -331,11 +330,10 @@ def run_grpo_training(
                             policy,
                             input_ids,
                             labels,
-                            return_token_entropy=True,
+                            return_token_entropy=False,
                             for_training=True,
                         )
                         log_probs = rp["log_probs"]
-                        ent = rp["token_entropy"]
                     adv_mb = advantages_2d[lo:hi].to(dtype=log_probs.dtype)
                     raw_mb = raw_2d[lo:hi].to(dtype=log_probs.dtype)
 
@@ -349,10 +347,6 @@ def run_grpo_training(
                         old_log_probs=None,
                         cliprange=cliprange if loss_type == "grpo_clip" else None,
                     )
-                    ent_f = ent.to(dtype=torch.float32)
-                    m_f = mask.to(dtype=torch.float32)
-                    denom = torch.clamp(m_f.sum(), min=1.0)
-                    last_entropy = float((ent_f * m_f).sum().item() / denom.item())
 
                 assert last_loss is not None
                 grad_norm = float(
@@ -368,7 +362,7 @@ def run_grpo_training(
                     train_step,
                     float(last_loss.detach()),
                     grad_norm,
-                    f"{last_entropy:.4f}" if last_entropy is not None else "n/a",
+                    "n/a",
                     train_reward_mean,
                     train_fmt_mean,
                     train_ans_mean,
@@ -383,8 +377,6 @@ def run_grpo_training(
                         "train/mean_answer_reward": train_ans_mean,
                         "train_step": train_step,
                     }
-                    if last_entropy is not None:
-                        log_payload["train/token_entropy"] = last_entropy
                     if "clipped" in last_meta and "ratio" in last_meta:
                         msum = mask.sum().clamp(min=1)
                         cf = (last_meta["clipped"] * mask.to(last_meta["clipped"].dtype)).sum() / msum
