@@ -103,20 +103,8 @@ def tokenize_prompt_and_output(
 
 
 def compute_entropy(logits: Tensor) -> Tensor:
-    """Per-position Shannon entropy of next-token distribution (over vocab), in nats.
-
-    Uses ``logsumexp`` for stable normalization and :func:`torch.special.entr` so ``0 log 0``
-    terms do not produce NaNs.
-
-    Args:
-        logits: Unnormalized log-probabilities, shape ``(batch, seq, vocab)``.
-
-    Returns:
-        Entropy ``-(p * log(p)).sum()`` over vocab at each position, shape ``(batch, seq)``.
-    """
-    log_norm = torch.logsumexp(logits, dim=-1, keepdim=True)
-    probs = torch.exp(logits - log_norm)
-    return torch.special.entr(probs).sum(dim=-1)
+    # Never materializes full (B, T, V) probs tensor
+    return torch.distributions.Categorical(logits=logits).entropy()
 
 
 def get_response_log_probs(
