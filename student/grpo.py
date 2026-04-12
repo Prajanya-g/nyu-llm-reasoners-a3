@@ -38,10 +38,8 @@ def compute_group_normalized_rewards(
     if group_size <= 0 or n % group_size != 0:
         raise ValueError("rollout batch size must be divisible by group_size")
 
-    raw_list = [
-        float(reward_fn(resp, gt)["reward"])
-        for resp, gt in zip(rollout_responses, repeated_ground_truths)
-    ]
+    scored = [reward_fn(resp, gt) for resp, gt in zip(rollout_responses, repeated_ground_truths)]
+    raw_list = [float(s["reward"]) for s in scored]
     raw = torch.tensor(raw_list, dtype=torch.float32)
     groups = raw.view(-1, group_size)
 
@@ -56,11 +54,14 @@ def compute_group_normalized_rewards(
 
     advantages = advantages_g.reshape(-1)
 
+    m = max(len(scored), 1)
     metadata: dict[str, float] = {
         "raw_mean": float(raw.mean().item()),
         "raw_std": float(raw.std(unbiased=False).item()),
         "raw_min": float(raw.min().item()),
         "raw_max": float(raw.max().item()),
+        "mean_format_reward": sum(float(s["format_reward"]) for s in scored) / m,
+        "mean_answer_reward": sum(float(s["answer_reward"]) for s in scored) / m,
         "n_groups": float(n // group_size),
         "group_size": float(group_size),
     }
