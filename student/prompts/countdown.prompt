@@ -1,11 +1,14 @@
 Answer the following problem. Explain your reasoning step by step. When you are finished, give your answer in this format: <answer>(your answer)</answer>.
 Problem
-{question} Your solution should include a series of steps "Step X:" where each step is a mathematical operation and the final step ultimately leads to the target number or it should be a single equation that results in the target.
+{question}
+You can use basic arithmetic operations (+, -, *, /) and each number can only be used once.
+Your solution should include a series of steps "Step X:" where each step is a mathematical operation and the final step ultimately leads to the target number or it should be a single equation that results in the target.
 Give your answer in the following format:
 <answer>
 (your answer)
 </answer>
-Where "(your answer)" is the list of steps to reach the target number or it should be a single equation that results in the target.
+Where "(your answer)" is the list of steps to reach the target number or
+it should be a single equation that results in the target.
 For example:
 If the list of numbers was [1, 2, 3] and the target was 1, you could write:
 <answer>
