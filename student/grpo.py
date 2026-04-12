@@ -145,6 +145,62 @@ def compute_policy_gradient_loss(
     raise ValueError(f"unknown loss_type: {loss_type!r}")
 
 
+def grpo_microbatch_train_step(
+    policy_log_probs: Tensor,
+    response_mask: Tensor,
+    gradient_accumulation_steps: int,
+    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"],
+    raw_rewards: Tensor | None = None,
+    advantages: Tensor | None = None,
+    old_log_probs: Tensor | None = None,
+    cliprange: float | None = None,
+) -> tuple[Tensor, dict[str, Tensor]]:
+    """Masked sum of per-token PG loss with grad-accum scaling (matches course snapshots).
+
+    Let :math:`S = \\sum(\\text{mask} \\cdot \\ell)` and :math:`g` =
+    ``gradient_accumulation_steps``. We call ``backward`` on :math:`S / (g^3 + g^4)`
+    and return :math:`S / g^4` for logging (mirrors the SFT microbatch split used in
+    this assignment’s snapshots). Gradients accumulate across repeated calls unless
+    the caller zeros ``policy_log_probs.grad``.
+
+    Args:
+        policy_log_probs: ``(B, T)`` trainable log-probs.
+        response_mask: ``(B, T)``; 1 on response tokens to optimize.
+        gradient_accumulation_steps: Microbatches per optimizer step (squared in divisor).
+        loss_type: PG variant (see :func:`compute_policy_gradient_loss`).
+        raw_rewards / advantages / old_log_probs / cliprange: Passed through when required.
+
+    Returns:
+        Scalar ``loss`` (same tensor used for ``backward``) and ``metadata``.
+    """
+    token_loss, pg_meta = compute_policy_gradient_loss(
+        policy_log_probs=policy_log_probs,
+        loss_type=loss_type,
+        raw_rewards=raw_rewards,
+        advantages=advantages,
+        old_log_probs=old_log_probs,
+        cliprange=cliprange,
+    )
+    mask = response_mask.to(dtype=policy_log_probs.dtype)
+    gas = float(gradient_accumulation_steps)
+    sum_pg = (token_loss * mask).sum()
+    denom_backward = gas**3 + gas**4
+    denom_log = gas**4
+    loss_backward = sum_pg / denom_backward
+    loss_log = sum_pg / denom_log
+
+    masked_pg_sum = sum_pg.detach()
+    metadata: dict[str, Tensor] = {
+        "masked_pg_sum": masked_pg_sum.detach(),
+        "num_response_tokens": mask.sum().detach(),
+    }
+    for key, value in pg_meta.items():
+        metadata[key] = value.detach() if isinstance(value, Tensor) else value
+
+    loss_backward.backward()
+    return loss_log, metadata
+
+
 def compute_naive_policy_gradient_loss(
     raw_rewards_or_advantages: Tensor,
     policy_log_probs: Tensor,
