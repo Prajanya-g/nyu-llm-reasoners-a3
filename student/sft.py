@@ -201,6 +201,28 @@ def masked_normalize(
     return weighted.sum(dim=dim) / normalize_constant
 
 
+def masked_mean(
+    tensor: Tensor,
+    mask: Tensor,
+    dim: int | None = None,
+) -> Tensor:
+    """Average selected elements (``mask`` true); reduction follows :meth:`torch.Tensor.mean`.
+
+    Args:
+        tensor: Values to average.
+        mask: Same shape as ``tensor``; true (or 1) includes entries in the mean.
+        dim: Axis to reduce, or ``None`` for one scalar mean over all masked entries.
+
+    Returns:
+        ``sum(tensor * mask) / sum(mask)`` with the same reduced shape as ``tensor.mean(dim)``.
+    """
+    m = mask.to(dtype=tensor.dtype)
+    weighted = tensor * m
+    if dim is None:
+        return weighted.sum() / m.sum()
+    return weighted.sum(dim=dim) / m.sum(dim=dim)
+
+
 def sft_microbatch_train_step(
     policy_log_probs: Tensor,
     response_mask: Tensor,

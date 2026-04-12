@@ -17,6 +17,7 @@ from student.grpo import (
 from student.sft import (
     compute_entropy,
     get_response_log_probs,
+    masked_mean,
     masked_normalize,
     sft_microbatch_train_step,
     tokenize_prompt_and_output,
@@ -232,7 +233,8 @@ def run_masked_mean(tensor: torch.Tensor, mask: torch.Tensor, dim: int | None = 
         torch.Tensor, the mean of the tensor along the specified
             dimension, considering only the elements with mask value 1.
     """
-    raise NotImplementedError
+    return masked_mean(tensor=tensor, mask=mask, dim=dim)
+
 
 def run_sft_microbatch_train_step(
     policy_log_probs: torch.Tensor,
