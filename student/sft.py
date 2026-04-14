@@ -216,6 +216,7 @@ def sft_microbatch_train_step(
     response_mask: Tensor,
     gradient_accumulation_steps: int,
     normalize_constant: float = 1.0,
+    use_masked_normalize: bool = True,
 ) -> tuple[Tensor, dict[str, Tensor]]:
     """Masked NLL over the response mask, ``backward`` on the same scalar that is returned.
 
@@ -229,6 +230,8 @@ def sft_microbatch_train_step(
         response_mask: Same shape; 1 for supervised response positions.
         gradient_accumulation_steps: Microbatches per optimizer step (squared in the divisor).
         normalize_constant: Divisor on the masked sum (before accumulation scaling).
+        use_masked_normalize: If ``True``, use :func:`masked_normalize`; else use
+            :func:`masked_mean` for the pre-accumulation reduction.
 
     Returns:
         Scalar ``loss`` (for logging) and ``metadata`` tensors.
@@ -236,8 +239,11 @@ def sft_microbatch_train_step(
     mask = response_mask.to(dtype=policy_log_probs.dtype)
     token_nll = -policy_log_probs
     gas = float(gradient_accumulation_steps)
-    denom = normalize_constant * gas * gas
-    loss = masked_normalize(token_nll, mask, denom, dim=None)
+    if use_masked_normalize:
+        denom = normalize_constant * gas * gas
+        loss = masked_normalize(token_nll, mask, denom, dim=None)
+    else:
+        loss = masked_mean(token_nll, mask, dim=None) / (gas * gas)
 
     masked_nll_sum = (token_nll * mask).sum()
     metadata: dict[str, Tensor] = {
@@ -415,6 +421,7 @@ def run_sft_training_run(
     policy_device: str,
     vllm_device: str,
     vllm_gpu_memory_utilization: float = 0.6,
+    use_masked_normalize: bool = True,
     use_wandb: bool,
     wandb_project: str,
     wandb_run_name: str | None,
@@ -562,6 +569,7 @@ def run_sft_training_run(
                     log_probs,
                     mask,
                     gradient_accumulation_steps,
+                    use_masked_normalize=use_masked_normalize,
                 )
                 if wb is not None and wb.run is not None:
                     wb.log({"train/loss": float(loss.detach()), "train_step": train_step})
@@ -649,6 +657,10 @@ def train(
         help="vLLM gpu_memory_utilization (fraction of GPU memory for weights + KV cache)",
     ),
     max_eval_examples: int = typer.Option(500, help="Cap validation examples per eval"),
+    use_masked_normalize: bool = typer.Option(
+        True,
+        help="Use masked_normalize for SFT loss reduction (set false to use masked_mean).",
+    ),
     seed: int = typer.Option(42),
     wandb_project: str = typer.Option("intellect-sft", help="Weights & Biases project"),
     no_wandb: bool = typer.Option(False, help="Disable wandb logging"),
@@ -681,6 +693,7 @@ def train(
             lr=lr,
             eval_every=eval_every,
             max_eval_examples=max_eval_examples,
+            use_masked_normalize=use_masked_normalize,
             policy_device=policy_device,
             vllm_device=vllm_device,
             vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
