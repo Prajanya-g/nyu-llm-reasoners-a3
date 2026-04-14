@@ -160,6 +160,7 @@ def run_grpo_training(
     wandb_project: str,
     wandb_run_name: str | None,
     max_train_examples: int | None,
+    use_masked_normalize: bool,
 ) -> None:
     assert train_batch_size % gradient_accumulation_steps == 0, (
         "train_batch_size must be divisible by gradient_accumulation_steps"
@@ -346,6 +347,7 @@ def run_grpo_training(
                         advantages=adv_mb if loss_type != "no_baseline" else None,
                         old_log_probs=None,
                         cliprange=cliprange if loss_type == "grpo_clip" else None,
+                        use_masked_normalize=use_masked_normalize,
                     )
 
                 assert last_loss is not None
@@ -506,6 +508,11 @@ def train(
     wandb_run_name: str | None = typer.Option(None),
     no_wandb: bool = typer.Option(False),
     log_level: str = typer.Option("INFO"),
+    use_masked_normalize: bool = typer.Option(
+        True,
+        "--use-masked-normalize/--no-use-masked-normalize",
+        help="Reduce GRPO microbatch loss with masked_normalize (default) or masked_mean.",
+    ),
 ) -> None:
     """Train with GRPO on Countdown (on-policy defaults: train_batch_size == rollout_batch_size).
 
@@ -544,6 +551,7 @@ def train(
         wandb_project=wandb_project,
         wandb_run_name=wandb_run_name,
         max_train_examples=max_train_examples,
+        use_masked_normalize=use_masked_normalize,
     )
 
 

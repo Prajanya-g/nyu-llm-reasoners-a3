@@ -261,6 +261,7 @@ def run_grpo_microbatch_train_step(
     advantages: torch.Tensor | None = None,
     old_log_probs: torch.Tensor | None = None,
     cliprange: float | None = None,
+    use_masked_normalize: bool = True,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute the policy gradient loss and backprop its gradients for a microbatch.
 
@@ -297,6 +298,7 @@ def run_grpo_microbatch_train_step(
         advantages=advantages,
         old_log_probs=old_log_probs,
         cliprange=cliprange,
+        use_masked_normalize=use_masked_normalize,
     )
 
 

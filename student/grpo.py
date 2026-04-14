@@ -8,6 +8,8 @@ from typing import Any, Literal
 import torch
 from torch import Tensor
 
+from student.sft import masked_mean, masked_normalize
+
 
 def compute_group_normalized_rewards(
     reward_fn: Callable[[str, str], dict[str, Any]],
@@ -155,6 +157,7 @@ def grpo_microbatch_train_step(
     advantages: Tensor | None = None,
     old_log_probs: Tensor | None = None,
     cliprange: float | None = None,
+    use_masked_normalize: bool = True,
 ) -> tuple[Tensor, dict[str, Tensor]]:
     """Masked sum of per-token PG loss with grad-accum scaling (matches course snapshots).
 
@@ -170,6 +173,9 @@ def grpo_microbatch_train_step(
         gradient_accumulation_steps: Microbatches per optimizer step (squared in divisor).
         loss_type: PG variant (see :func:`compute_policy_gradient_loss`).
         raw_rewards / advantages / old_log_probs / cliprange: Passed through when required.
+        use_masked_normalize: If ``True``, reduce with :func:`masked_normalize` (sum over mask,
+            divide by :math:`g^3+g^4` for backward and :math:`g^4` for logging). If ``False``,
+            use :func:`masked_mean` then the same divisors (per-token mean, then scale).
 
     Returns:
         Scalar ``loss`` (same tensor used for ``backward``) and ``metadata``.
@@ -187,8 +193,12 @@ def grpo_microbatch_train_step(
     sum_pg = (token_loss * mask).sum()
     denom_backward = gas**3 + gas**4
     denom_log = gas**4
-    loss_backward = sum_pg / denom_backward
-    loss_log = sum_pg / denom_log
+    if use_masked_normalize:
+        loss_backward = masked_normalize(token_loss, mask, denom_backward, dim=None)
+        loss_log = masked_normalize(token_loss, mask, denom_log, dim=None)
+    else:
+        loss_backward = masked_mean(token_loss, mask, dim=None) / denom_backward
+        loss_log = masked_mean(token_loss, mask, dim=None) / denom_log
 
     masked_pg_sum = sum_pg.detach()
     metadata: dict[str, Tensor] = {
