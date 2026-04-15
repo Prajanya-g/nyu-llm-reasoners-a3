@@ -45,9 +45,9 @@ def tokenize_prompt_and_output(
 ) -> dict[str, Tensor]:
     """Tokenize prompts and outputs separately, concatenate, build ``response_mask``.
 
-    Prompt and output both use ``add_special_tokens=False`` (no leading BOS). A single EOS
-    is appended when the tokenizer’s ``eos_token_id`` is set and the sequence does not
-    already end with it.
+    Prompt and output both use ``add_special_tokens=False`` (no leading BOS). Trailing EOS
+    tokens (from ``tokenizer.eos_token_id``, e.g. Qwen) are stripped from the concatenation,
+    then exactly one EOS is appended when ``eos_token_id`` is set.
 
     Args:
         prompt_strs: Batch of prompts.
@@ -70,14 +70,15 @@ def tokenize_prompt_and_output(
     for prompt, output in zip(prompt_strs, output_strs):
         prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
         output_ids = tokenizer(output, add_special_tokens=False)["input_ids"]
-        # TEMPORARY: remove after debugging snapshot / max_len issues
-        print(f"prompt_ids={prompt_ids}")
-        print(f"output_ids={output_ids}")
         full = prompt_ids + output_ids
 
-        # Append single EOS if not already ending with one
-        eos_id = tokenizer.eos_token_id
-        if eos_id is not None and (not full or full[-1] != eos_id):
+        # Remove any trailing EOS from output_ids before appending one
+        eos_id = tokenizer.eos_token_id  # 151643 for Qwen
+        while full and full[-1] == eos_id:
+            full = full[:-1]
+
+        # Append single EOS
+        if eos_id is not None:
             full = full + [eos_id]
 
         full_sequences.append(full)
