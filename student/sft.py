@@ -45,8 +45,9 @@ def tokenize_prompt_and_output(
 ) -> dict[str, Tensor]:
     """Tokenize prompts and outputs separately, concatenate, build ``response_mask``.
 
-    Snapshots for this assignment expect plain prompt/output tokenization (no leading BOS on the
-    prompt) plus one trailing EOS at the sequence end before padding/shift.
+    Prompt and output both use ``add_special_tokens=False`` (no leading BOS). If concatenation
+    yields two consecutive EOS ids at the end, drop one. Then append a single EOS if the
+    sequence does not already end with EOS (snapshots expect the shifted window to end on EOS).
 
     Args:
         prompt_strs: Batch of prompts.
@@ -71,8 +72,12 @@ def tokenize_prompt_and_output(
         output_ids = tokenizer(output, add_special_tokens=False)["input_ids"]
         full = prompt_ids + output_ids
         eos_id = tokenizer.eos_token_id
+        if eos_id is not None and len(full) >= 2 and full[-1] == eos_id and full[-2] == eos_id:
+            full = full[:-1]
         if eos_id is not None and (not full or full[-1] != eos_id):
             full = full + [eos_id]
+        if eos_id is not None and len(full) >= 2 and full[-1] == eos_id and full[-2] == eos_id:
+            full = full[:-1]
         full_sequences.append(full)
         prompt_token_lens.append(len(prompt_ids))
 
