@@ -45,9 +45,8 @@ def tokenize_prompt_and_output(
 ) -> dict[str, Tensor]:
     """Tokenize prompts and outputs separately, concatenate, build ``response_mask``.
 
-    Prompt uses ``add_special_tokens=True`` (matches course snapshot / HF SFT). Output uses
-    ``add_special_tokens=False``. If concat produces two consecutive EOS ids, drop one so
-    labels do not repeat EOS where the snapshot expects a pad slot.
+    Snapshots for this assignment expect plain prompt/output tokenization (no leading BOS on the
+    prompt) plus one trailing EOS at the sequence end before padding/shift.
 
     Args:
         prompt_strs: Batch of prompts.
@@ -68,12 +67,12 @@ def tokenize_prompt_and_output(
     prompt_token_lens: list[int] = []
 
     for prompt, output in zip(prompt_strs, output_strs):
-        prompt_ids = tokenizer(prompt, add_special_tokens=True)["input_ids"]
+        prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
         output_ids = tokenizer(output, add_special_tokens=False)["input_ids"]
         full = prompt_ids + output_ids
         eos_id = tokenizer.eos_token_id
-        if eos_id is not None and len(full) >= 2 and full[-1] == eos_id and full[-2] == eos_id:
-            full = full[:-1]
+        if eos_id is not None and (not full or full[-1] != eos_id):
+            full = full + [eos_id]
         full_sequences.append(full)
         prompt_token_lens.append(len(prompt_ids))
 
@@ -93,7 +92,7 @@ def tokenize_prompt_and_output(
         labels[row] = torch.tensor(lab, dtype=torch.long)
         if len(full) >= 2:
             start = max(p_len - 1, 0)
-            response_mask[row, start : len(full) - 1] = 1
+            response_mask[row, start: len(full) - 1] = 1
 
     return {
         "input_ids": input_ids,
