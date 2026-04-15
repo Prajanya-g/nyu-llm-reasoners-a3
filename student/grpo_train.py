@@ -189,11 +189,8 @@ def run_grpo_training(
     )
     if loss_type not in ("no_baseline", "reinforce_with_baseline", "grpo_clip"):
         raise ValueError(f"unknown loss_type: {loss_type!r}")
-    if loss_type == "grpo_clip":
-        raise NotImplementedError(
-            "This trainer is on-policy only: use loss_type=reinforce_with_baseline (or no_baseline). "
-            "grpo_clip needs per-token old_log_probs from the behavior policy at rollout time."
-        )
+    if loss_type == "grpo_clip" and cliprange is None:
+        raise ValueError("cliprange is required when loss_type='grpo_clip'")
 
     torch.manual_seed(seed)
     gen = torch.Generator()
@@ -310,21 +307,46 @@ def run_grpo_training(
             train_fmt_mean = reward_meta["mean_format_reward"]
             train_ans_mean = reward_meta["mean_answer_reward"]
 
+            microbatches: list[dict[str, torch.Tensor]] = []
+            for m in range(n_microbatches):
+                lo = m * micro_train_batch_size
+                hi = lo + micro_train_batch_size
+                mb_prompts = prompts[lo:hi]
+                mb_out = completions[lo:hi]
+                tokens = tokenize_prompt_and_output(mb_prompts, mb_out, tokenizer)
+                microbatches.append(
+                    {
+                        "input_ids": tokens["input_ids"].to(device),
+                        "labels": tokens["labels"].to(device),
+                        "mask": tokens["response_mask"].to(device),
+                        "advantages": advantages_2d[lo:hi].to(device),
+                        "raw_rewards": raw_2d[lo:hi].to(device),
+                    }
+                )
+
+            if loss_type == "grpo_clip":
+                with torch.inference_mode():
+                    for mb in microbatches:
+                        rp_old = get_response_log_probs(
+                            policy,
+                            mb["input_ids"],
+                            mb["labels"],
+                            return_token_entropy=False,
+                        )
+                        mb["old_log_probs"] = rp_old["log_probs"].detach().cpu()
+
             for _epoch in range(epochs_per_rollout_batch):
                 optimizer.zero_grad(set_to_none=True)
                 last_loss: torch.Tensor | None = None
                 last_meta: dict[str, torch.Tensor] = {}
                 grad_norm: float = 0.0
+                last_mask: torch.Tensor | None = None
 
-                for m in range(n_microbatches):
-                    lo = m * micro_train_batch_size
-                    hi = lo + micro_train_batch_size
-                    mb_prompts = prompts[lo:hi]
-                    mb_out = completions[lo:hi]
-                    tokens = tokenize_prompt_and_output(mb_prompts, mb_out, tokenizer)
-                    input_ids = tokens["input_ids"].to(device)
-                    labels = tokens["labels"].to(device)
-                    mask = tokens["response_mask"].to(device)
+                for mb in microbatches:
+                    input_ids = mb["input_ids"]
+                    labels = mb["labels"]
+                    mask = mb["mask"]
+                    last_mask = mask
 
                     with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
                         rp = get_response_log_probs(
@@ -335,8 +357,11 @@ def run_grpo_training(
                             for_training=True,
                         )
                         log_probs = rp["log_probs"]
-                    adv_mb = advantages_2d[lo:hi].to(dtype=log_probs.dtype)
-                    raw_mb = raw_2d[lo:hi].to(dtype=log_probs.dtype)
+                    adv_mb = mb["advantages"].to(dtype=log_probs.dtype)
+                    raw_mb = mb["raw_rewards"].to(dtype=log_probs.dtype)
+                    old_mb = None
+                    if loss_type == "grpo_clip":
+                        old_mb = mb["old_log_probs"].to(device=device, dtype=log_probs.dtype)
 
                     last_loss, last_meta = grpo_microbatch_train_step(
                         log_probs,
@@ -345,7 +370,7 @@ def run_grpo_training(
                         loss_type,
                         raw_rewards=raw_mb if loss_type == "no_baseline" else None,
                         advantages=adv_mb if loss_type != "no_baseline" else None,
-                        old_log_probs=None,
+                        old_log_probs=old_mb,
                         cliprange=cliprange if loss_type == "grpo_clip" else None,
                         use_masked_normalize=use_masked_normalize,
                     )
@@ -379,9 +404,11 @@ def run_grpo_training(
                         "train/mean_answer_reward": train_ans_mean,
                         "train_step": train_step,
                     }
-                    if "clipped" in last_meta and "ratio" in last_meta:
-                        msum = mask.sum().clamp(min=1)
-                        cf = (last_meta["clipped"] * mask.to(last_meta["clipped"].dtype)).sum() / msum
+                    if "clipped" in last_meta and "ratio" in last_meta and last_mask is not None:
+                        msum = last_mask.sum().clamp(min=1)
+                        cf = (
+                            last_meta["clipped"] * last_mask.to(last_meta["clipped"].dtype)
+                        ).sum() / msum
                         log_payload["train/clip_fraction"] = float(cf.detach())
                     wb.log(log_payload)
 
