@@ -45,9 +45,9 @@ def tokenize_prompt_and_output(
 ) -> dict[str, Tensor]:
     """Tokenize prompts and outputs separately, concatenate, build ``response_mask``.
 
-    Prompt and output both use ``add_special_tokens=False`` (no leading BOS). If concatenation
-    yields two consecutive EOS ids at the end, drop one. Then append a single EOS if the
-    sequence does not already end with EOS (snapshots expect the shifted window to end on EOS).
+    Prompt and output both use ``add_special_tokens=False`` (no leading BOS). A single EOS
+    is appended when the tokenizer’s ``eos_token_id`` is set and the sequence does not
+    already end with it.
 
     Args:
         prompt_strs: Batch of prompts.
@@ -70,14 +70,16 @@ def tokenize_prompt_and_output(
     for prompt, output in zip(prompt_strs, output_strs):
         prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
         output_ids = tokenizer(output, add_special_tokens=False)["input_ids"]
+        # TEMPORARY: remove after debugging snapshot / max_len issues
+        print(f"prompt_ids={prompt_ids}")
+        print(f"output_ids={output_ids}")
         full = prompt_ids + output_ids
+
+        # Append single EOS if not already ending with one
         eos_id = tokenizer.eos_token_id
-        if eos_id is not None and len(full) >= 2 and full[-1] == eos_id and full[-2] == eos_id:
-            full = full[:-1]
         if eos_id is not None and (not full or full[-1] != eos_id):
             full = full + [eos_id]
-        if eos_id is not None and len(full) >= 2 and full[-1] == eos_id and full[-2] == eos_id:
-            full = full[:-1]
+
         full_sequences.append(full)
         prompt_token_lens.append(len(prompt_ids))
 
