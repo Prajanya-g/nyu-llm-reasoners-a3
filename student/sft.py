@@ -71,6 +71,7 @@ def tokenize_prompt_and_output(
         prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
         output_ids = tokenizer(output, add_special_tokens=False)["input_ids"]
         full = prompt_ids + output_ids
+        print(f"DEBUG full[-3:]: {full[-3:]}", flush=True)
 
         # Remove any trailing EOS from output_ids before appending one
         eos_id = tokenizer.eos_token_id  # 151643 for Qwen
